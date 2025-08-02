@@ -15,13 +15,44 @@
 //!
 //! # Quick Start
 //!
-//! ```rust
+//! To use the PolyTorus SDK, you need to provide your own implementations of the four core traits:
+//! - `ExecutionLayer`: Handles transaction execution and smart contracts
+//! - `SettlementLayer`: Manages batch settlement and challenges
+//! - `ConsensusLayer`: Provides block consensus and validation
+//! - `DataAvailabilityLayer`: Ensures data availability and storage
+//!
+//! ```rust,ignore
 //! use sdk::{PolyTorusClient, ClientConfig};
+//! use traits::{ExecutionLayer, SettlementLayer, ConsensusLayer, DataAvailabilityLayer};
+//!
+//! // You must implement these traits for your specific blockchain architecture
+//! struct MyExecutionLayer { /* your implementation */ }
+//! struct MySettlementLayer { /* your implementation */ }
+//! struct MyConsensusLayer { /* your implementation */ }
+//! struct MyDataAvailabilityLayer { /* your implementation */ }
+//!
+//! // Implement the required traits for each layer
+//! impl ExecutionLayer for MyExecutionLayer {
+//!     // implement all required methods
+//! }
+//! // ... implement other traits
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // Create a new client
-//!     let client = PolyTorusClient::new(ClientConfig::default()).await?;
+//!     // Create your layer implementations
+//!     let execution_layer = MyExecutionLayer::new();
+//!     let settlement_layer = MySettlementLayer::new();
+//!     let consensus_layer = MyConsensusLayer::new();
+//!     let data_availability_layer = MyDataAvailabilityLayer::new();
+//!     
+//!     // Create a new client with your layer implementations
+//!     let client = PolyTorusClient::new(
+//!         ClientConfig::default(),
+//!         execution_layer,
+//!         settlement_layer,
+//!         consensus_layer,
+//!         data_availability_layer,
+//!     ).await?;
 //!     
 //!     // Create a wallet
 //!     let wallet = client.create_wallet().await?;
@@ -38,6 +69,9 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Note: This SDK provides the client structure and trait definitions. You are responsible
+//! for implementing the actual layer logic according to your blockchain's requirements.
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -45,15 +79,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// Re-export core types for convenience
-pub use traits::*;
-pub use wallet::{HdWallet, Wallet, Address as WalletAddress, KeyPair, Signature, Mnemonic};
+// Trait definitions
+pub mod traits;
 
-// Internal layer imports
-use consensus::{PolyTorusConsensusLayer, ConsensusConfig};
-use data_availability::{PolyTorusDataAvailabilityLayer, DataAvailabilityConfig};
-use execution::{PolyTorusExecutionLayer, ExecutionConfig};
-use settlement::{PolyTorusSettlementLayer, SettlementConfig};
+// Re-export core types for convenience
+pub use traits::{ExecutionLayer, SettlementLayer, ConsensusLayer, DataAvailabilityLayer};
+pub use traits::{Transaction, Block, Hash, TransactionReceipt, Event, AccountState};
+pub use traits::{Result, ScriptTransactionType};
+pub use wallet::{HdWallet, Wallet, Address as WalletAddress, KeyPair, Signature, Mnemonic};
 
 // ============================================================================
 // SDK Configuration
@@ -63,7 +96,6 @@ use settlement::{PolyTorusSettlementLayer, SettlementConfig};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub network: NetworkConfig,
-    pub layers: LayerConfigs,
     pub wallet: WalletConfig,
 }
 
@@ -71,7 +103,6 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             network: NetworkConfig::default(),
-            layers: LayerConfigs::default(),
             wallet: WalletConfig::default(),
         }
     }
@@ -91,26 +122,6 @@ impl Default for NetworkConfig {
             chain_id: 1,
             network_name: "polytorus-mainnet".to_string(),
             is_testnet: false,
-        }
-    }
-}
-
-/// Layer configurations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayerConfigs {
-    pub execution: ExecutionConfig,
-    pub settlement: SettlementConfig,
-    pub consensus: ConsensusConfig,
-    pub data_availability: DataAvailabilityConfig,
-}
-
-impl Default for LayerConfigs {
-    fn default() -> Self {
-        Self {
-            execution: ExecutionConfig::default(),
-            settlement: SettlementConfig::default(),
-            consensus: ConsensusConfig::default(),
-            data_availability: DataAvailabilityConfig::default(),
         }
     }
 }
@@ -136,44 +147,44 @@ impl Default for WalletConfig {
 // ============================================================================
 
 /// High-level client for interacting with PolyTorus blockchain
-pub struct PolyTorusClient {
-    config: ClientConfig,
-    execution_layer: Arc<RwLock<PolyTorusExecutionLayer>>,
-    settlement_layer: Arc<RwLock<PolyTorusSettlementLayer>>,
-    consensus_layer: Arc<RwLock<PolyTorusConsensusLayer>>,
-    data_availability_layer: Arc<RwLock<PolyTorusDataAvailabilityLayer>>,
+pub struct PolyTorusClient<E, S, C, D>
+where
+    E: ExecutionLayer + Send + Sync + 'static,
+    S: SettlementLayer + Send + Sync + 'static,
+    C: ConsensusLayer + Send + Sync + 'static,
+    D: DataAvailabilityLayer + Send + Sync + 'static,
+{
+    pub config: ClientConfig,
+    execution_layer: Arc<RwLock<E>>,
+    settlement_layer: Arc<RwLock<S>>,
+    consensus_layer: Arc<RwLock<C>>,
+    data_availability_layer: Arc<RwLock<D>>,
     wallets: Arc<RwLock<HashMap<String, HdWallet>>>,
 }
 
-impl PolyTorusClient {
-    /// Create a new PolyTorus client
-    pub async fn new(config: ClientConfig) -> Result<Self> {
-        let execution_layer = Arc::new(RwLock::new(
-            PolyTorusExecutionLayer::new(config.layers.execution.clone())?,
-        ));
-        let settlement_layer = Arc::new(RwLock::new(
-            PolyTorusSettlementLayer::new(config.layers.settlement.clone())?,
-        ));
-        let consensus_layer = Arc::new(RwLock::new(
-            PolyTorusConsensusLayer::new(config.layers.consensus.clone())?,
-        ));
-        let data_availability_layer = Arc::new(RwLock::new(
-            PolyTorusDataAvailabilityLayer::new(config.layers.data_availability.clone())?,
-        ));
-
+impl<E, S, C, D> PolyTorusClient<E, S, C, D>
+where
+    E: ExecutionLayer + Send + Sync + 'static,
+    S: SettlementLayer + Send + Sync + 'static,
+    C: ConsensusLayer + Send + Sync + 'static,
+    D: DataAvailabilityLayer + Send + Sync + 'static,
+{
+    /// Create a new PolyTorus client with provided layer implementations
+    pub async fn new(
+        config: ClientConfig,
+        execution_layer: E,
+        settlement_layer: S,
+        consensus_layer: C,
+        data_availability_layer: D,
+    ) -> Result<Self> {
         Ok(Self {
             config,
-            execution_layer,
-            settlement_layer,
-            consensus_layer,
-            data_availability_layer,
+            execution_layer: Arc::new(RwLock::new(execution_layer)),
+            settlement_layer: Arc::new(RwLock::new(settlement_layer)),
+            consensus_layer: Arc::new(RwLock::new(consensus_layer)),
+            data_availability_layer: Arc::new(RwLock::new(data_availability_layer)),
             wallets: Arc::new(RwLock::new(HashMap::new())),
         })
-    }
-
-    /// Create a new client with default configuration
-    pub async fn new_default() -> Result<Self> {
-        Self::new(ClientConfig::default()).await
     }
 
     // ========================================================================
@@ -445,22 +456,22 @@ impl PolyTorusClient {
     // ========================================================================
 
     /// Get direct access to execution layer
-    pub fn execution_layer(&self) -> Arc<RwLock<PolyTorusExecutionLayer>> {
+    pub fn execution_layer(&self) -> Arc<RwLock<E>> {
         self.execution_layer.clone()
     }
 
     /// Get direct access to settlement layer
-    pub fn settlement_layer(&self) -> Arc<RwLock<PolyTorusSettlementLayer>> {
+    pub fn settlement_layer(&self) -> Arc<RwLock<S>> {
         self.settlement_layer.clone()
     }
 
     /// Get direct access to consensus layer
-    pub fn consensus_layer(&self) -> Arc<RwLock<PolyTorusConsensusLayer>> {
+    pub fn consensus_layer(&self) -> Arc<RwLock<C>> {
         self.consensus_layer.clone()
     }
 
     /// Get direct access to data availability layer
-    pub fn data_availability_layer(&self) -> Arc<RwLock<PolyTorusDataAvailabilityLayer>> {
+    pub fn data_availability_layer(&self) -> Arc<RwLock<D>> {
         self.data_availability_layer.clone()
     }
 
@@ -534,49 +545,105 @@ pub struct ContractCallResult {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_client_creation() {
-        let client = PolyTorusClient::new_default().await;
-        assert!(client.is_ok());
+    #[test]
+    fn test_client_config_creation() {
+        let config = ClientConfig::default();
+        assert_eq!(config.network.chain_id, 1);
+        assert_eq!(config.network.network_name, "polytorus-mainnet");
+        assert!(!config.network.is_testnet);
+        assert_eq!(config.wallet.derivation_path, "m/44'/0'/0'");
+        assert_eq!(config.wallet.address_format, "native_segwit");
     }
 
-    #[tokio::test]
-    async fn test_wallet_creation() {
-        let client = PolyTorusClient::new_default().await.unwrap();
-        let wallet = client.create_wallet().await;
-        assert!(wallet.is_ok());
-        
-        let wallet_info = wallet.unwrap();
-        assert!(!wallet_info.id.is_empty());
-        assert!(!wallet_info.address.is_empty());
-        assert!(!wallet_info.mnemonic.is_empty());
+    #[test]
+    fn test_network_config_default() {
+        let network_config = NetworkConfig::default();
+        assert_eq!(network_config.chain_id, 1);
+        assert_eq!(network_config.network_name, "polytorus-mainnet");
+        assert!(!network_config.is_testnet);
     }
 
-    #[tokio::test]
-    async fn test_data_storage() {
-        let client = PolyTorusClient::new_default().await.unwrap();
-        let data = b"Hello, PolyTorus!";
-        
-        let hash = client.store_data(data).await;
-        assert!(hash.is_ok());
-        
-        let stored_data = client.retrieve_data(&hash.unwrap()).await;
-        assert!(stored_data.is_ok());
-        assert_eq!(stored_data.unwrap(), Some(data.to_vec()));
+    #[test]
+    fn test_wallet_config_default() {
+        let wallet_config = WalletConfig::default();
+        assert_eq!(wallet_config.derivation_path, "m/44'/0'/0'");
+        assert_eq!(wallet_config.address_format, "native_segwit");
     }
 
-    #[tokio::test]
-    async fn test_mining() {
-        let client = PolyTorusClient::new_default().await.unwrap();
+    #[test]
+    fn test_wallet_info_serialization() {
+        let wallet_info = WalletInfo {
+            id: "test-id".to_string(),
+            address: "test-address".to_string(),
+            mnemonic: "test mnemonic words".to_string(),
+            derivation_path: "m/44'/0'/0'".to_string(),
+        };
+
+        // Test that WalletInfo can be serialized and deserialized
+        let serialized = serde_json::to_string(&wallet_info).unwrap();
+        let deserialized: WalletInfo = serde_json::from_str(&serialized).unwrap();
         
-        // Set low difficulty for fast mining in tests
-        client.set_mining_difficulty(0).await.unwrap();
+        assert_eq!(wallet_info.id, deserialized.id);
+        assert_eq!(wallet_info.address, deserialized.address);
+        assert_eq!(wallet_info.mnemonic, deserialized.mnemonic);
+        assert_eq!(wallet_info.derivation_path, deserialized.derivation_path);
+    }
+
+    #[test]
+    fn test_contract_deployment_serialization() {
+        let deployment = ContractDeployment {
+            contract_hash: "test-contract-hash".to_string(),
+            transaction_hash: "test-tx-hash".to_string(),
+            gas_used: 50000,
+        };
+
+        // Test that ContractDeployment can be serialized and deserialized
+        let serialized = serde_json::to_string(&deployment).unwrap();
+        let deserialized: ContractDeployment = serde_json::from_str(&serialized).unwrap();
         
-        let block = client.mine_block().await;
-        assert!(block.is_ok());
+        assert_eq!(deployment.contract_hash, deserialized.contract_hash);
+        assert_eq!(deployment.transaction_hash, deserialized.transaction_hash);
+        assert_eq!(deployment.gas_used, deserialized.gas_used);
+    }
+
+    #[test]
+    fn test_contract_call_result_serialization() {
+        let call_result = ContractCallResult {
+            transaction_hash: "test-tx-hash".to_string(),
+            return_data: vec![1, 2, 3, 4],
+            gas_used: 30000,
+            events: vec![],
+        };
+
+        // Test that ContractCallResult can be serialized and deserialized
+        let serialized = serde_json::to_string(&call_result).unwrap();
+        let deserialized: ContractCallResult = serde_json::from_str(&serialized).unwrap();
         
-        let mined_block = block.unwrap();
-        assert!(!mined_block.hash.is_empty());
-        assert_eq!(mined_block.transactions.len(), 0); // Empty block
+        assert_eq!(call_result.transaction_hash, deserialized.transaction_hash);
+        assert_eq!(call_result.return_data, deserialized.return_data);
+        assert_eq!(call_result.gas_used, deserialized.gas_used);
+        assert_eq!(call_result.events.len(), deserialized.events.len());
+    }
+
+    #[test]
+    fn test_trait_re_exports() {
+        // Test that types are properly re-exported
+        // This is a compile-time test - if it compiles, the re-exports work
+        use crate::{Transaction, Block, Hash, TransactionReceipt, Event, AccountState};
+        use crate::{ScriptTransactionType};
+        
+        // These are just type checks to ensure the re-exports are working
+        let _tx: Option<Transaction> = None;
+        let _block: Option<Block> = None;
+        let _hash: Option<Hash> = None;
+        let _receipt: Option<TransactionReceipt> = None;
+        let _event: Option<Event> = None;
+        let _account: Option<AccountState> = None;
+        let _script_type: Option<ScriptTransactionType> = None;
+        
+        // Test that we can access trait types through the SDK
+        assert!(std::any::type_name::<Transaction>().contains("Transaction"));
+        assert!(std::any::type_name::<Block>().contains("Block"));
+        assert!(std::any::type_name::<Hash>().contains("String"));
     }
 }
